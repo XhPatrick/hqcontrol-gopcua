@@ -181,6 +181,16 @@ func RemoteCertificate(cert []byte) Option {
 	}
 }
 
+// VerifyServerCertificate validates the authenticated server certificate before
+// accepting each signed OPN and before activating a session. The ApplicationURI
+// is empty during OPN validation. A nil callback retains existing behavior.
+func VerifyServerCertificate(verify func(certDER []byte, applicationURI string) error) Option {
+	return func(cfg *Config) error {
+		cfg.sechan.VerifyServerCertificate = verify
+		return nil
+	}
+}
+
 // RemoteCertificateFile sets the server certificate from the file
 // in PEM or DER encoding.
 func RemoteCertificateFile(filename string) Option {

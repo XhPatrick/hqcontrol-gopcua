@@ -809,10 +809,23 @@ func (c *Client) CreateSession(ctx context.Context, cfg *uasc.SessionConfig) (*S
 			return err
 		}
 
+		if res == nil || res.ServerSignature == nil {
+			return ua.StatusBadSecurityChecksFailed
+		}
 		err := sc.VerifySessionSignature(res.ServerCertificate, nonce, res.ServerSignature.Signature)
 		if err != nil {
 			log.Printf("error verifying session signature: %s", err)
-			return nil
+			return err
+		}
+
+		if c.cfg.sechan.VerifyServerCertificate != nil && c.cfg.sechan.SecurityMode != ua.MessageSecurityModeNone {
+			uri, err := serverApplicationURI(res.ServerEndpoints, c.cfg.sechan.SecurityMode, c.cfg.sechan.SecurityPolicyURI)
+			if err != nil {
+				return err
+			}
+			if err := sc.VerifySessionCertificate(res.ServerCertificate, uri); err != nil {
+				return err
+			}
 		}
 
 		// Ensure we have a valid identity token that the server will accept before trying to activate a session

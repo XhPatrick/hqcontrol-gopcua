@@ -107,6 +107,9 @@ type SecureChannel struct {
 	// cfg is the configuration for the secure channel.
 	cfg *Config
 
+	verifiedRemoteCertificateMu sync.RWMutex
+	verifiedRemoteCertificate   []byte
+
 	// time returns the current time. When not set it defaults to time.Now().
 	time func() time.Time
 
@@ -515,6 +518,12 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	m.Data, err = s.verifyAndDecrypt(m, b, decryptWith)
 	if err != nil {
 		return nil, err
+	}
+
+	if m.MessageType == "OPN" && s.cfg.VerifyServerCertificate != nil && s.cfg.SecurityMode != ua.MessageSecurityModeNone {
+		if err := s.verifyRemoteCertificate(m.AsymmetricSecurityHeader.SenderCertificate); err != nil {
+			return nil, err
+		}
 	}
 
 	n, err := m.SequenceHeader.Decode(m.Data)
