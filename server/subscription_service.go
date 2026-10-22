@@ -15,30 +15,76 @@ import (
 type SubscriptionService struct {
 	srv *Server
 	// pub sub stuff
-	Mu   sync.Mutex
-	Subs map[uint32]*Subscription
+	Mu                 sync.Mutex
+	Subs               map[uint32]*Subscription
+	lastSubscriptionID uint32
+	closing            bool
 }
 
 // get rid of all references to a subscription and all monitored items that are pointed at this subscription.
 func (s *SubscriptionService) DeleteSubscription(id uint32) {
 	s.Mu.Lock()
-	defer s.Mu.Unlock()
+	sub := s.Subs[id]
+	s.Mu.Unlock()
+	s.deleteSubscriptionInstance(sub)
+}
 
-	sub, ok := s.Subs[id]
-	if ok {
-		sub.Mu.Lock()
-		if sub.running {
-			sub.running = false
-			close(sub.shutdown)
-		}
-		sub.Mu.Unlock()
+func (s *SubscriptionService) deleteSubscriptionInstance(sub *Subscription) {
+	if sub == nil {
+		return
 	}
+	s.Mu.Lock()
+	sub.Mu.Lock()
+	if sub.running {
+		sub.running = false
+		close(sub.shutdown)
+		sub.cancel()
+	}
+	sub.Mu.Unlock()
+	s.Mu.Unlock()
+	// Registry admission must remain available while the item service drains.
+	s.srv.MonitoredItemService.deleteSubscriptionInstance(sub)
+}
 
-	delete(s.Subs, id)
+func (s *SubscriptionService) finishSubscription(sub *Subscription) {
+	s.deleteSubscriptionInstance(sub)
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	if s.Subs[sub.ID] == sub {
+		delete(s.Subs, sub.ID)
+	}
+	close(sub.done)
+}
 
-	// ask the monitored item service to purge out any items that use this subscription
-	s.srv.MonitoredItemService.DeleteSub(id)
+func (s *SubscriptionService) closeSubscriptions(ctx context.Context) error {
+	s.Mu.Lock()
+	s.closing = true
+	subs := make([]*Subscription, 0, len(s.Subs))
+	for _, sub := range s.Subs {
+		subs = append(subs, sub)
+	}
+	s.Mu.Unlock()
+	for _, sub := range subs {
+		s.deleteSubscriptionInstance(sub)
+	}
+	for _, sub := range subs {
+		select {
+		case <-sub.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
 
+func (s *SubscriptionService) nextSubscriptionIDLocked() (uint32, error) {
+	for s.lastSubscriptionID != ^uint32(0) {
+		s.lastSubscriptionID++
+		if _, occupied := s.Subs[s.lastSubscriptionID]; !occupied {
+			return s.lastSubscriptionID, nil
+		}
+	}
+	return 0, ua.StatusBadTooManySubscriptions
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.2
@@ -54,8 +100,14 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
+	if s.closing {
+		return nil, ua.StatusBadShutdown
+	}
 
-	newsubid := uint32(len(s.Subs)) + 1
+	newsubid, err := s.nextSubscriptionIDLocked()
+	if err != nil {
+		return nil, err
+	}
 
 	if s.srv.cfg.logger != nil {
 		s.srv.cfg.logger.Info("New Sub %d for %v", newsubid, sc.RemoteAddr())
@@ -210,9 +262,6 @@ func (s *SubscriptionService) DeleteSubscriptions(sc *uasc.SecureChannel, r ua.R
 	}
 	session := s.srv.Session(req.Header())
 
-	s.Mu.Lock()
-	defer s.Mu.Unlock()
-
 	results := make([]ua.StatusCode, len(req.SubscriptionIDs))
 	for i := range req.SubscriptionIDs {
 
@@ -220,18 +269,20 @@ func (s *SubscriptionService) DeleteSubscriptions(sc *uasc.SecureChannel, r ua.R
 		if s.srv.cfg.logger != nil {
 			s.srv.cfg.logger.Info("Subscription %d deleted by client", subid)
 		}
+		s.Mu.Lock()
 		sub, ok := s.Subs[subid]
-		if !ok {
+		if !ok || !sub.running {
+			s.Mu.Unlock()
 			results[i] = ua.StatusBadSubscriptionIDInvalid
 			continue
 		}
-		if session.AuthTokenID.String() != sub.Session.AuthTokenID.String() {
+		if session == nil || sub.Session == nil || session.AuthTokenID.String() != sub.Session.AuthTokenID.String() {
+			s.Mu.Unlock()
 			results[i] = ua.StatusBadSessionIDInvalid
 			continue
 		}
-		// delete subscription gets the lock so we set them up to run in the background
-		// once this function releases its lock
-		go s.DeleteSubscription(subid)
+		s.Mu.Unlock()
+		s.deleteSubscriptionInstance(sub)
 		results[i] = ua.StatusOK
 	}
 	return &ua.DeleteSubscriptionsResponse{
@@ -282,15 +333,27 @@ type Subscription struct {
 	Mu       sync.Mutex
 	running  bool
 	shutdown chan struct{}
+	done     chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 func NewSubscription() *Subscription {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Subscription{
 		//SeqNums:       map[uint32]struct{}{},
 		NotifyChannel: make(chan *ua.MonitoredItemNotification, 100),
 		ModifyChannel: make(chan *ua.ModifySubscriptionRequest, 2),
 		shutdown:      make(chan struct{}),
+		done:          make(chan struct{}),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
+}
+
+// Done closes only after the subscription run and its item cleanup have exited.
+func (s *Subscription) Done() <-chan struct{} {
+	return s.done
 }
 
 func (s *Subscription) Update(req *ua.ModifySubscriptionRequest) {
@@ -329,7 +392,7 @@ func (s *Subscription) keepalive(pubreq PubReq) error {
 		Results:                  []ua.StatusCode{},
 		DiagnosticInfos:          []*ua.DiagnosticInfo{},
 	}
-	err := s.Channel.SendResponseWithContext(context.Background(), pubreq.ID, response)
+	err := s.Channel.SendResponseWithContext(s.ctx, pubreq.ID, response)
 	if err != nil {
 		return err
 	}
@@ -345,7 +408,7 @@ func (s *Subscription) run() {
 		if s.srv.srv.cfg.logger != nil {
 			s.srv.srv.cfg.logger.Info("Subscription %d shutting down.", s.ID)
 		}
-		s.srv.DeleteSubscription(s.ID)
+		s.srv.finishSubscription(s)
 	}()
 
 	keepalive_counter := 0
@@ -383,7 +446,7 @@ func (s *Subscription) run() {
 					// nothing to publish, increment the keepalive counter and send a keepalive if it
 					// has been enough intervals.
 					keepalive_counter++
-					if keepalive_counter > int(s.RevisedMaxKeepAliveCount) {
+					if keepalive_counter >= int(s.RevisedMaxKeepAliveCount) {
 						keepalive_counter = 0
 						select {
 						case pubreq := <-s.Session.PublishRequests:
@@ -493,7 +556,7 @@ func (s *Subscription) run() {
 			Results:                  []ua.StatusCode{},
 			DiagnosticInfos:          []*ua.DiagnosticInfo{},
 		}
-		err := s.Channel.SendResponseWithContext(context.Background(), pubreq.ID, response)
+		err := s.Channel.SendResponseWithContext(s.ctx, pubreq.ID, response)
 		if err != nil {
 			if s.srv.srv.cfg.logger != nil {
 				s.srv.srv.cfg.logger.Error("problem sending channel response: %v", err)

@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rsa"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -21,6 +22,7 @@ import (
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uacp"
 	"github.com/gopcua/opcua/uapolicy"
+	"github.com/gopcua/opcua/uasc"
 )
 
 //go:generate go run ../cmd/predefined-nodes/main.go
@@ -41,6 +43,13 @@ type Server struct {
 	l  *uacp.Listener
 	cb *channelBroker
 	sb *sessionBroker
+
+	lifecycleMu sync.Mutex
+	runCancel   context.CancelFunc
+	acceptDone  chan struct{}
+	monitorDone chan struct{}
+	stopDone    chan struct{}
+	closing     bool
 
 	// nextSecureChannelID uint32
 
@@ -240,6 +249,14 @@ func (s *Server) URLs() []string {
 // If s was not initialized with NewServer(), addr defaults
 // to localhost:0 to let the OS select a random port
 func (s *Server) Start(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.closing || s.runCancel != nil {
+		return fmt.Errorf("server lifecycle has already started or closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var err error
 
 	if len(s.cfg.endpoints) == 0 {
@@ -265,8 +282,25 @@ func (s *Server) Start(ctx context.Context) error {
 		s.cb = newChannelBroker(s.cfg.logger)
 	}
 
-	go s.acceptAndRegister(ctx, s.l)
-	go s.monitorConnections(ctx)
+	runCtx, cancel := context.WithCancel(ctx)
+	s.runCancel = cancel
+	s.acceptDone = make(chan struct{})
+	s.monitorDone = make(chan struct{})
+	s.stopDone = make(chan struct{})
+	listener := s.l
+	context.AfterFunc(runCtx, func() {
+		defer close(s.stopDone)
+		_ = listener.Close()
+		s.cb.stopConnections()
+	})
+	go func() {
+		defer close(s.acceptDone)
+		s.acceptAndRegister(runCtx, listener)
+	}()
+	go func() {
+		defer close(s.monitorDone)
+		s.monitorConnections(runCtx)
+	}()
 
 	return nil
 }
@@ -278,17 +312,39 @@ func (s *Server) setServerState(state ua.ServerState) {
 }
 
 // Close gracefully shuts the server down by closing all open connections,
-// and stops listening on all endpoints
+// and stops listening on all endpoints. The server owner calls Close outside
+// its service handlers so the receiver can finish before Close returns.
 func (s *Server) Close() error {
+	s.lifecycleMu.Lock()
+	s.closing = true
+	cancel := s.runCancel
+	s.lifecycleMu.Unlock()
 	s.setServerState(ua.ServerStateShutdown)
-
-	// Close the listener, preventing new sessions from starting
-	if s.l != nil {
-		s.l.Close()
+	if cancel == nil {
+		return nil
 	}
+	s.SubscriptionService.Mu.Lock()
+	s.SubscriptionService.closing = true
+	s.SubscriptionService.Mu.Unlock()
+	cancel()
+	ctx, stop := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stop()
+	if err := waitServerLoop(ctx, s.stopDone); err != nil {
+		return err
+	}
+	err := s.cb.closeContext(ctx)
+	err = errors.Join(err, s.SubscriptionService.closeSubscriptions(ctx))
+	err = errors.Join(err, waitServerLoop(ctx, s.acceptDone))
+	return errors.Join(err, waitServerLoop(ctx, s.monitorDone))
+}
 
-	// Shut down all secure channels and UACP connections
-	return s.cb.Close()
+func waitServerLoop(ctx context.Context, done <-chan struct{}) error {
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type temporary interface {
@@ -297,76 +353,83 @@ type temporary interface {
 
 func (s *Server) acceptAndRegister(ctx context.Context, l *uacp.Listener) {
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			c, err := l.Accept(ctx)
-			if err != nil {
-				switch x := err.(type) {
-				case *net.OpError:
-					// socket closed. Cannot recover from this.
-					if s.cfg.logger != nil {
-						s.cfg.logger.Error("socket closed: %s", err)
-					}
-					return
-				case temporary:
-					if x.Temporary() {
-						continue
-					}
-				default:
-					if s.cfg.logger != nil {
-						s.cfg.logger.Error("error accepting connection: %s", err)
-					}
-					continue
-				}
+		c, err := l.Accept(ctx)
+		if err != nil {
+			if !s.retryAccept(ctx, err) {
+				return
 			}
-
-			go s.cb.RegisterConn(ctx, c, s.cfg.certificate, s.cfg.privateKey)
-			if s.cfg.logger != nil {
-				s.cfg.logger.Info("registered connection: %s", c.RemoteAddr())
-			}
+			continue
 		}
+		if err := s.cb.startConnection(ctx, c, s.cfg.certificate, s.cfg.privateKey); err != nil {
+			return
+		}
+		if s.cfg.logger != nil {
+			s.cfg.logger.Info("registered connection: %s", c.RemoteAddr())
+		}
+	}
+}
+
+func (s *Server) retryAccept(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	switch x := err.(type) {
+	case *net.OpError:
+		if s.cfg.logger != nil {
+			s.cfg.logger.Error("socket closed: %s", err)
+		}
+		return false
+	case temporary:
+		return x.Temporary()
+	default:
+		if s.cfg.logger != nil {
+			s.cfg.logger.Error("error accepting connection: %s", err)
+		}
+		return true
 	}
 }
 
 // monitorConnections reads messages off the secure channel connection and
 // sends the message to the service handler
 func (s *Server) monitorConnections(ctx context.Context) {
-	for ctx.Err() == nil {
+	for {
 		msg := s.cb.ReadMessage(ctx)
-		if msg == nil {
-			continue // ctx is likely done, ctx.Err will be non-nil
+		if msg == nil || ctx.Err() != nil {
+			return
 		}
-		if msg.Err != nil {
-			if s.cfg.logger != nil {
-				s.cfg.logger.Error("monitorConnections: Error received: %s\n", msg.Err)
-			}
-			continue // todo(fs): close SC???
-		}
-		if resp := msg.Response(); resp != nil {
-			if s.cfg.logger != nil {
-				s.cfg.logger.Error("monitorConnections: Server received response %T ???", resp)
-			}
-			continue // todo(fs): close SC???
-		}
-		if s.cfg.logger != nil {
-			s.cfg.logger.Debug("monitorConnections: Received Message: %T", msg.Request())
-		}
-		s.cb.mu.RLock()
-		sc, ok := s.cb.s[msg.SecureChannelID]
-		s.cb.mu.RUnlock()
-		if !ok {
-			// if the secure channel ID is 0, this is probably a open secure channel request.
-			if s.cfg.logger != nil && msg.SecureChannelID != 0 {
-				s.cfg.logger.Error("monitorConnections: Unknown SecureChannel: %d", msg.SecureChannelID)
-			}
-			continue
-		}
-
-		// todo: should this be delegated to another goroutine in case handling this hangs?
-		s.handleService(ctx, sc, msg.RequestID, msg.Request())
+		s.handleBrokerMessage(ctx, msg)
 	}
+}
+
+func (s *Server) handleBrokerMessage(ctx context.Context, msg *uasc.MessageBody) {
+	if msg.Err != nil {
+		if s.cfg.logger != nil {
+			s.cfg.logger.Error("monitorConnections: Error received: %s\n", msg.Err)
+		}
+		return // todo(fs): close SC???
+	}
+	if resp := msg.Response(); resp != nil {
+		if s.cfg.logger != nil {
+			s.cfg.logger.Error("monitorConnections: Server received response %T ???", resp)
+		}
+		return // todo(fs): close SC???
+	}
+	if s.cfg.logger != nil {
+		s.cfg.logger.Debug("monitorConnections: Received Message: %T", msg.Request())
+	}
+	s.cb.mu.RLock()
+	sc, ok := s.cb.s[msg.SecureChannelID]
+	s.cb.mu.RUnlock()
+	if !ok {
+		// if the secure channel ID is 0, this is probably a open secure channel request.
+		if s.cfg.logger != nil && msg.SecureChannelID != 0 {
+			s.cfg.logger.Error("monitorConnections: Unknown SecureChannel: %d", msg.SecureChannelID)
+		}
+		return
+	}
+
+	// todo: should this be delegated to another goroutine in case handling this hangs?
+	s.handleService(ctx, sc, msg.RequestID, msg.Request())
 }
 
 // initEndpoints builds the endpoint list from the server's configuration

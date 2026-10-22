@@ -97,13 +97,27 @@ func (s *MonitoredItemService) DeleteSub(id uint32) {
 	}
 }
 
+func (s *MonitoredItemService) deleteSubscriptionInstance(sub *Subscription) {
+	s.Mu.Lock()
+	ids := make([]uint32, 0, len(s.Subs[sub.ID]))
+	for _, item := range s.Subs[sub.ID] {
+		if item != nil && item.Sub == sub {
+			ids = append(ids, item.ID)
+		}
+	}
+	s.Mu.Unlock()
+	for _, id := range ids {
+		s.DeleteMonitoredItem(id)
+	}
+}
+
 func (s *MonitoredItemService) ChangeNotification(n *ua.NodeID) {
 
 	s.Mu.Lock()
-	defer s.Mu.Unlock()
-	items, ok := s.Nodes[n.String()]
+	items := append([]*MonitoredItem(nil), s.Nodes[n.String()]...)
+	s.Mu.Unlock()
 
-	if !ok {
+	if len(items) == 0 {
 		// this node isn't monitored - don't have to do anything.
 		return
 	}
@@ -124,12 +138,18 @@ func (s *MonitoredItemService) ChangeNotification(n *ua.NodeID) {
 			val.Value = &ua.DataValue{}
 			val.Value.Status = ua.StatusBad
 			val.Value.EncodingMask |= ua.DataValueStatusCode
-			item.Sub.NotifyChannel <- val
+			select {
+			case item.Sub.NotifyChannel <- val:
+			case <-item.Sub.shutdown:
+			}
 			continue
 		}
 		dv := ns.Attribute(n, item.Req.ItemToMonitor.AttributeID)
 		val.Value = dv
-		item.Sub.NotifyChannel <- val
+		select {
+		case item.Sub.NotifyChannel <- val:
+		case <-item.Sub.shutdown:
+		}
 	}
 
 }
@@ -166,9 +186,6 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	if err != nil {
 		return nil, err
 	}
-	s.Mu.Lock()
-	defer s.Mu.Unlock()
-
 	count := len(req.ItemsToCreate)
 
 	res := make([]*ua.MonitoredItemCreateResult, count)
@@ -178,11 +195,13 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 		s.SubService.srv.cfg.logger.Debug("Creating monitored items for sub #%d", subID)
 	}
 	s.SubService.Mu.Lock()
+	defer s.SubService.Mu.Unlock()
 	sub, ok := s.SubService.Subs[subID]
-	s.SubService.Mu.Unlock()
-	if !ok {
+	if !ok || !sub.running {
 		return nil, errors.New("sub doesn't exist")
 	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 
 	sess := s.SubService.srv.Session(req.RequestHeader)
 	if sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {

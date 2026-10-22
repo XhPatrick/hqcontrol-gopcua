@@ -146,13 +146,33 @@ func Listen(ctx context.Context, endpoint string, ack *Acknowledge) (*Listener, 
 // The first param ctx is to be passed to monitor(), which monitors and handles
 // incoming messages automatically in another goroutine.
 func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c, err := l.l.AcceptTCP()
 	if err != nil {
 		return nil, err
 	}
+	return l.acceptHandshake(ctx, c)
+}
+
+func (l *Listener) acceptHandshake(ctx context.Context, c *net.TCPConn) (*Conn, error) {
 	conn := &Conn{TCPConn: c, id: nextid(), ack: l.ack}
-	if err := conn.srvhandshake(l.endpoint); err != nil {
-		c.Close()
+	canceled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = c.Close()
+		close(canceled)
+	})
+	err := conn.srvhandshake(ctx, l.endpoint)
+	if !stop() {
+		<-canceled
+	}
+	if ctx.Err() != nil {
+		_ = conn.Close()
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 	return conn, nil
@@ -285,7 +305,7 @@ func (c *Conn) Handshake(ctx context.Context, endpoint string) error {
 	}
 }
 
-func (c *Conn) srvhandshake(endpoint string) error {
+func (c *Conn) srvhandshake(ctx context.Context, endpoint string) error {
 	b, err := c.Receive()
 	if err != nil {
 		c.SendError(ua.StatusBadTCPInternalError)
@@ -326,9 +346,9 @@ func (c *Conn) srvhandshake(endpoint string) error {
 			return errors.Errorf("uacp: invalid endpoint url %s", rhe.EndpointURL)
 		}
 		debug.Printf("uacp %d: connecting to %s", c.id, rhe.ServerURI)
-		c.Close()
+		_ = c.TCPConn.Close()
 		var dialer net.Dialer
-		c2, err := dialer.DialContext(context.Background(), "tcp", rhe.ServerURI)
+		c2, err := dialer.DialContext(ctx, "tcp", rhe.ServerURI)
 		if err != nil {
 			return err
 		}

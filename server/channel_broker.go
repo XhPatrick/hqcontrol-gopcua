@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"io"
 	mrand "math/rand"
+	"net"
 	"sync"
 	"time"
 
@@ -16,7 +17,11 @@ import (
 type channelBroker struct {
 	endpoints map[string]*ua.EndpointDescription
 
-	wg sync.WaitGroup
+	connections map[*uacp.Conn]struct{}
+	stop        chan struct{}
+	done        chan struct{}
+	closing     bool
+	drained     bool
 
 	// mu protects concurrent modification of s, secureChannelID, and secureTokenID
 	mu sync.RWMutex
@@ -39,6 +44,9 @@ func newChannelBroker(logger Logger) *channelBroker {
 	rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
 	return &channelBroker{
 		endpoints:       make(map[string]*ua.EndpointDescription),
+		connections:     make(map[*uacp.Conn]struct{}),
+		stop:            make(chan struct{}),
+		done:            make(chan struct{}),
 		s:               make(map[uint32]*uasc.SecureChannel),
 		msgChan:         make(chan *uasc.MessageBody),
 		secureChannelID: uint32(rng.Int31()),
@@ -52,108 +60,150 @@ func newChannelBroker(logger Logger) *channelBroker {
 // Response channel
 // Blocks until the context is done, the connection closes, or a critical error
 func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, localCert []byte, localKey *rsa.PrivateKey) error {
-	cfg := defaultChannelConfig()
-	cfg.Certificate = localCert
-	cfg.LocalKey = localKey
-
-	c.mu.Lock()
-	c.secureChannelID++
-	c.secureTokenID++
-	secureChannelID := c.secureChannelID
-	secureTokenID := c.secureTokenID
-	sequenceNumber := uint32(mrand.Int31n(1023) + 1)
-	c.mu.Unlock()
-
-	errch := make(chan error, 1)
-	sc, err := uasc.NewServerSecureChannel(
-		"", // todo(fs): this is most likely wrong
-		conn,
-		cfg,
-		errch,
-		secureChannelID,
-		sequenceNumber,
-		secureTokenID,
-	)
+	secureChannelID, secureTokenID, err := c.admitConnection(conn)
 	if err != nil {
-		if c.logger != nil {
-			c.logger.Error("Error creating secure channel for new connection: %s", err)
-		}
+		_ = conn.Close()
 		return err
 	}
+	return c.serveAdmittedConnection(ctx, conn, localCert, localKey, secureChannelID, secureTokenID)
+}
 
-	c.mu.Lock()
-	c.s[secureChannelID] = sc
-	if c.logger != nil {
-		c.logger.Info("Registered new channel (id %d) now at %d channels", secureChannelID, len(c.s))
+func (c *channelBroker) startConnection(ctx context.Context, conn *uacp.Conn, localCert []byte, localKey *rsa.PrivateKey) error {
+	secureChannelID, secureTokenID, err := c.admitConnection(conn)
+	if err != nil {
+		_ = conn.Close()
+		return err
 	}
-	c.mu.Unlock()
-	c.wg.Add(1)
-outer:
-	for {
-		select {
-		case <-ctx.Done():
-			// todo(fs): return error?
-			if c.logger != nil {
-				c.logger.Warn("Context done, closing Secure Channel %d", secureChannelID)
-			}
-			break outer
-
-		default:
-			msg := sc.Receive(ctx)
-			if msg.Err == io.EOF {
-				if c.logger != nil {
-					c.logger.Warn("Secure Channel %d closed", secureChannelID)
-				}
-				break outer
-			} else if msg.Err != nil {
-				if c.logger != nil {
-					c.logger.Error("Secure Channel %d error: %s", secureChannelID, msg.Err)
-				}
-				break outer
-			}
-			// todo(fs): honor ctx
-			c.msgChan <- msg
-		}
-	}
-
-	c.mu.Lock()
-	delete(c.s, secureChannelID)
-	c.mu.Unlock()
-	c.wg.Done()
-
+	go func() { _ = c.serveAdmittedConnection(ctx, conn, localCert, localKey, secureChannelID, secureTokenID) }()
 	return nil
 }
 
-// Close gracefully closes all secure channels
-// todo(fs): use ctx
-func (c *channelBroker) Close() error {
-	var err error
-	c.mu.Lock()
-	for _, s := range c.s {
-		s.Close()
-	}
-	c.mu.Unlock()
-
-	// Wait for all goroutines to finish or timeout
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		c.wg.Wait()
+func (c *channelBroker) serveAdmittedConnection(ctx context.Context, conn *uacp.Conn, localCert []byte, localKey *rsa.PrivateKey, secureChannelID, secureTokenID uint32) error {
+	defer c.releaseConnection(conn, secureChannelID)
+	defer conn.Close()
+	canceled := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		defer close(canceled)
+		_ = conn.Close()
+	})
+	defer func() {
+		if !stopCancellation() {
+			<-canceled
+		}
 	}()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second): // todo(fs): magic number
-		if c.logger != nil {
-			c.logger.Error("CloseAll: timed out waiting for channels to exit")
+	cfg := defaultChannelConfig()
+	cfg.Certificate, cfg.LocalKey = localCert, localKey
+	errch := make(chan error, 1)
+	sc, err := uasc.NewServerSecureChannel("", conn, cfg, errch, secureChannelID,
+		uint32(mrand.Int31n(1023)+1), secureTokenID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(); _ = sc.Close() }()
+	c.mu.Lock()
+	c.s[secureChannelID] = sc
+	count := len(c.s)
+	c.mu.Unlock()
+	if c.logger != nil {
+		c.logger.Info("Registered new channel (id %d) now at %d channels", secureChannelID, count)
+	}
+	return c.receiveConnection(ctx, sc)
+}
+
+func (c *channelBroker) admitConnection(conn *uacp.Conn) (uint32, uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing {
+		return 0, 0, net.ErrClosed
+	}
+	c.connections[conn] = struct{}{}
+	c.secureChannelID++
+	c.secureTokenID++
+	return c.secureChannelID, c.secureTokenID, nil
+}
+
+func (c *channelBroker) releaseConnection(conn *uacp.Conn, id uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.s, id)
+	delete(c.connections, conn)
+	c.signalDrainedLocked()
+}
+
+func (c *channelBroker) signalDrainedLocked() {
+	if c.closing && len(c.connections) == 0 && !c.drained {
+		c.drained = true
+		close(c.done)
+	}
+}
+
+func (c *channelBroker) receiveConnection(ctx context.Context, sc *uasc.SecureChannel) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.stop:
+			return net.ErrClosed
+		default:
+		}
+		msg := sc.Receive(ctx)
+		if msg.Err == io.EOF {
+			return nil
+		}
+		if msg.Err != nil {
+			return msg.Err
+		}
+		select {
+		case c.msgChan <- msg:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.stop:
+			return net.ErrClosed
 		}
 	}
+}
 
-	return err
+func (c *channelBroker) stopConnections() {
+	c.mu.Lock()
+	if !c.closing {
+		c.closing = true
+		close(c.stop)
+	}
+	connections := make([]*uacp.Conn, 0, len(c.connections))
+	for conn := range c.connections {
+		connections = append(connections, conn)
+	}
+	c.signalDrainedLocked()
+	c.mu.Unlock()
+	// Closing the original socket interrupts native reads and writes. It must
+	// precede secure-channel Close, which otherwise may itself attempt a write.
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+}
+
+// Close closes admission and joins all admitted secure-channel registrations.
+func (c *channelBroker) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return c.closeContext(ctx)
+}
+
+func (c *channelBroker) closeContext(ctx context.Context) error {
+	c.stopConnections()
+	select {
+	case <-c.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (c *channelBroker) ReadMessage(ctx context.Context) *uasc.MessageBody {
 	select {
 	case <-ctx.Done():
+		return nil
+	case <-c.stop:
 		return nil
 	case msg := <-c.msgChan:
 		return msg
